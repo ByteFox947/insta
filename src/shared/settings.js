@@ -24,6 +24,8 @@
     { id: 'jh', label: 'Johannesburg, South Africa', host: 'jh.storage.bunnycdn.com' },
   ];
 
+  const SETTINGS_VERSION = 2;
+
   const DEFAULTS = Object.freeze({
     zone: '',
     region: 'de',
@@ -31,8 +33,16 @@
     pullZoneUrl: '',
     skipExisting: true,
     saveInfoJson: true,
-    requestDelaySec: 3,
+    requestDelaySec: 6,
   });
+
+  // Version 1 saved a 3 s default pause, which runs into Instagram's limits
+  // more often; move people who kept that default to the new one.
+  function migrate(raw) {
+    if (!raw || Number(raw.version) >= SETTINGS_VERSION) return raw;
+    const delay = Number(raw.requestDelaySec) === 3 ? DEFAULTS.requestDelaySec : raw.requestDelaySec;
+    return { ...raw, requestDelaySec: delay };
+  }
 
   function cleanZone(value) {
     return String(value ?? '').trim().replace(/[^A-Za-z0-9_-]/g, '');
@@ -67,6 +77,7 @@
   function normalize(raw) {
     const s = { ...DEFAULTS, ...(raw || {}) };
     return {
+      version: SETTINGS_VERSION,
       zone: cleanZone(s.zone),
       region: REGIONS.some((r) => r.id === s.region) ? s.region : DEFAULTS.region,
       folder: cleanFolder(s.folder),
@@ -96,7 +107,7 @@
 
   async function load() {
     const { settings } = await chrome.storage.local.get('settings');
-    return normalize(settings);
+    return normalize(migrate(settings));
   }
 
   async function save(values) {

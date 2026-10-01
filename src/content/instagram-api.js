@@ -13,19 +13,35 @@
   const ORIGIN = 'https://www.instagram.com';
   const APP_ID = '936619743392459'; // Instagram web app ID
   const ASBD_ID = '129477';
-  const PAGE_SIZE = 12; // same page size the website uses
+  // Same page sizes as gallery-dl: fewer requests per profile = fewer limits.
+  const FEED_PAGE_SIZE = 30;
+  const REELS_PAGE_SIZE = 50;
   const SHORTCODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
   const USER_CACHE_KEY = 'igUserCache';
 
+  const LOGIN_MESSAGE = 'Log in to Instagram in this browser first.';
+  const LOGGED_OUT_MESSAGE =
+    "Instagram didn't send any data, and this browser doesn't look logged in to Instagram. " +
+    'Log in at instagram.com in this same Chrome profile, then try again.';
+  const CHECKPOINT_MESSAGE =
+    'Instagram wants you to confirm your account. Finish the check on instagram.com, then try again.';
+
   let wwwClaim = readSessionStorage('www-claim-v2') || '0';
+  let pacing = null; // { gapMs(), sleep(ms) } while a save job runs
+  let lastRequestAt = 0;
 
   class InstagramError extends Error {
-    /** kind: login | checkpoint | rate_limit | not_found | private | network | api */
-    constructor(kind, message, status) {
+    /**
+     * kind: login | checkpoint | rate_limit | limited | server | not_found | private | network | api
+     * "limited" means Instagram answered with a web page (usually its home
+     * page) instead of data, which is what it does while limiting an account.
+     */
+    constructor(kind, message, { status, detail } = {}) {
       super(message);
       this.name = 'InstagramError';
       this.kind = kind;
       this.status = status;
+      this.detail = detail || ''; // request + response summary, shown in the log
     }
   }
 
@@ -37,16 +53,60 @@
     }
   }
 
-  function csrfToken() {
-    const match = document.cookie.match(/(?:^|;\s*)csrftoken=([^;]*)/);
+  function readCookie(name) {
+    const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
     return match ? decodeURIComponent(match[1]) : '';
+  }
+
+  // ds_user_id is Instagram's script-readable "logged-in user" cookie
+  // (sessionid itself is HttpOnly, so it can't be checked from here).
+  function looksLoggedIn() {
+    return /^\d+$/.test(readCookie('ds_user_id'));
   }
 
   function withoutEmpty(values) {
     return Object.entries(values || {}).filter(([, v]) => v !== undefined && v !== null && v !== '');
   }
 
-  async function request(path, { method = 'GET', params, form } = {}) {
+  function pathOf(href) {
+    try {
+      return new URL(href).pathname;
+    } catch {
+      return '?';
+    }
+  }
+
+  // JSON, optionally behind the "for (;;);" guard some Meta endpoints use.
+  function parseJson(text) {
+    const body = String(text || '').replace(/^\s*for\s*\(;;\);/, '');
+    if (!/^\s*[[{]/.test(body)) return null;
+    try {
+      return JSON.parse(body);
+    } catch {
+      return null;
+    }
+  }
+
+  /** While a job runs, keeps a gap between Instagram requests. */
+  function setPacing(value) {
+    pacing = value;
+  }
+
+  async function paced(fn) {
+    if (pacing) {
+      const wait = lastRequestAt + pacing.gapMs() - Date.now();
+      if (wait > 0) await pacing.sleep(wait);
+    }
+    lastRequestAt = Date.now();
+    return fn();
+  }
+
+  /** `what` names the data in error messages, e.g. "the list of posts". */
+  function request(path, { method = 'GET', params, form, what = 'the data' } = {}) {
+    return paced(() => send(path, { method, params, form, what }));
+  }
+
+  async function send(path, { method, params, form, what }) {
     const url = new URL(path, ORIGIN);
     for (const [key, value] of withoutEmpty(params)) url.searchParams.set(key, String(value));
 
@@ -57,7 +117,7 @@
       'X-IG-WWW-Claim': wwwClaim,
       'X-Requested-With': 'XMLHttpRequest',
     };
-    const token = csrfToken();
+    const token = readCookie('csrftoken');
     if (token) headers['X-CSRFToken'] = token;
 
     let body;
@@ -76,41 +136,43 @@
     const claim = response.headers.get('x-ig-set-www-claim');
     if (claim) wwwClaim = claim;
 
-    if (response.redirected && /\/challenge\//.test(response.url)) {
-      throw new InstagramError('checkpoint', 'Instagram wants you to confirm your account. Finish the check on instagram.com, then try again.');
-    }
-    if (response.redirected && /\/accounts\/login/.test(response.url)) {
-      throw new InstagramError('login', 'Log in to Instagram in this browser first.');
-    }
-
-    const text = await response.text();
-    let data = null;
-    try {
-      data = text ? JSON.parse(text) : null;
-    } catch {
-      data = null;
-    }
-    const message = String(data?.message || '');
     const status = response.status;
+    const finalPath = response.redirected ? pathOf(response.url) : '';
+    const detail = `${method} ${url.pathname} → HTTP ${status}${finalPath ? ` after a redirect to ${finalPath}` : ''}`;
+    const fail = (kind, message) => new InstagramError(kind, message, { status, detail });
+
+    if (finalPath.startsWith('/challenge/')) throw fail('checkpoint', CHECKPOINT_MESSAGE);
+    if (finalPath.startsWith('/accounts/login')) throw fail('login', LOGIN_MESSAGE);
+
+    const data = parseJson(await response.text());
+    const message = String(data?.message || '');
 
     if (status === 429 || /wait a few minutes|too many requests|rate.?limit/i.test(message)) {
-      throw new InstagramError('rate_limit', 'Instagram is asking us to slow down.', status);
+      throw fail('rate_limit', 'Instagram is asking us to slow down.');
     }
     if (/checkpoint_required|challenge_required/.test(message) || data?.checkpoint_url) {
-      throw new InstagramError('checkpoint', 'Instagram wants you to confirm your account. Finish the check on instagram.com, then try again.', status);
+      throw fail('checkpoint', CHECKPOINT_MESSAGE);
     }
-    if (data?.require_login || message === 'login_required' || status === 401) {
-      throw new InstagramError('login', 'Log in to Instagram in this browser first.', status);
+    if (data?.require_login || message === 'login_required' || status === 401) throw fail('login', LOGIN_MESSAGE);
+    if (/not authorized to view/i.test(message)) throw fail('private', "This account is private and you don't follow it.");
+    if (status === 404) throw fail('not_found', `Instagram couldn't find ${what}.`);
+    if (status >= 500) throw fail('server', `Instagram had a server problem (HTTP ${status}) while loading ${what}.`);
+    if (!data && response.ok) {
+      // A web page instead of JSON. Instagram does this, usually by
+      // redirecting to its home page, while it's limiting an account.
+      if (!looksLoggedIn()) throw fail('login', LOGGED_OUT_MESSAGE);
+      throw fail(
+        'limited',
+        finalPath === '/'
+          ? `Instagram is temporarily limiting your account: it sent its home page instead of ${what}.`
+          : `Instagram sent a web page instead of ${what}, which usually means it's temporarily limiting your account.`,
+      );
     }
-    if (/not authorized to view/i.test(message)) {
-      throw new InstagramError('private', "This account is private and you don't follow it.", status);
-    }
-    if (status === 404) throw new InstagramError('not_found', 'Instagram says this does not exist.', status);
     if (!response.ok || data?.status === 'fail') {
-      throw new InstagramError('api', message ? `Instagram error: ${message}` : `Instagram returned HTTP ${status}.`, status);
-    }
-    if (!data) {
-      throw new InstagramError('api', 'Instagram returned a web page instead of data. Are you logged in?', status);
+      throw fail(
+        'api',
+        message ? `Instagram error while loading ${what}: ${message}` : `Instagram returned HTTP ${status} while loading ${what}.`,
+      );
     }
     return data;
   }
@@ -159,6 +221,49 @@
     }
   }
 
+  const PROFILE_WHAT = 'the profile details';
+
+  // gallery-dl's default since web_profile_info started hitting limits (Feb 2026).
+  async function userFromSearch(username, wanted) {
+    const data = await request('/web/search/topsearch/', { params: { query: username }, what: PROFILE_WHAT });
+    const hit = (data?.users || []).map((entry) => entry?.user).find((u) => u?.username?.toLowerCase() === wanted);
+    const id = hit && (hit.pk || hit.pk_id || hit.id);
+    if (!id) return null;
+    return { id: String(id), username: hit.username, isPrivate: Boolean(hit.is_private), followedByViewer: undefined, postCount: null };
+  }
+
+  async function userFromProfileInfo(username) {
+    const data = await request('/api/v1/users/web_profile_info/', { params: { username }, what: PROFILE_WHAT });
+    const u = data?.data?.user;
+    if (!u?.id) return null;
+    return {
+      id: String(u.id),
+      username: u.username || username,
+      isPrivate: Boolean(u.is_private),
+      followedByViewer: u.followed_by_viewer,
+      postCount: u.edge_owner_to_timeline_media?.count ?? null,
+    };
+  }
+
+  // Last resort (gallery-dl's "web" strategy): the profile page's HTML has the ID.
+  async function userFromProfilePage(username, wanted) {
+    const html = await paced(async () => {
+      let response;
+      try {
+        response = await fetch(`${ORIGIN}/${encodeURIComponent(wanted)}/`, {
+          credentials: 'include',
+          headers: { Accept: 'text/html' },
+        });
+      } catch (error) {
+        throw new InstagramError('network', `Couldn't reach Instagram (${error.message}).`);
+      }
+      if (response.status === 404) throw new InstagramError('not_found', `Couldn't find @${username}.`);
+      return response.ok ? response.text() : '';
+    });
+    const match = html.match(/"profile_id":"(\d+)"/) || html.match(/"profilePage_(\d+)"/);
+    return match ? { id: match[1], username, isPrivate: false, followedByViewer: undefined, postCount: null } : null;
+  }
+
   function isFatal(error) {
     return error?.kind === 'login' || error?.kind === 'checkpoint';
   }
@@ -166,67 +271,43 @@
   /** Resolves a username to { id, username, isPrivate, followedByViewer, postCount }. */
   async function getUser(username) {
     const wanted = username.toLowerCase();
-    const errors = [];
 
-    try {
-      const data = await request('/api/v1/users/web_profile_info/', { params: { username } });
-      const u = data?.data?.user;
-      if (u?.id) {
-        const user = {
-          id: String(u.id),
-          username: u.username || username,
-          isPrivate: Boolean(u.is_private),
-          followedByViewer: u.followed_by_viewer,
-          postCount: u.edge_owner_to_timeline_media?.count ?? null,
-        };
-        await rememberUser(user);
-        return user;
-      }
-    } catch (error) {
-      if (isFatal(error)) throw error;
-      errors.push(error);
-    }
-
-    // Fallback used by gallery-dl since web_profile_info is often rate-limited.
-    try {
-      const data = await request('/web/search/topsearch/', { params: { query: username } });
-      const hit = (data?.users || []).map((entry) => entry?.user).find((u) => u?.username?.toLowerCase() === wanted);
-      const id = hit && (hit.pk || hit.pk_id || hit.id);
-      if (id) {
-        const user = {
-          id: String(id),
-          username: hit.username,
-          isPrivate: Boolean(hit.is_private),
-          followedByViewer: undefined,
-          postCount: null,
-        };
-        await rememberUser(user);
-        return user;
-      }
-    } catch (error) {
-      if (isFatal(error)) throw error;
-      errors.push(error);
-    }
-
+    // Known from an earlier run: no lookup request needed at all.
     const cached = (await readUserCache())[wanted];
-    if (cached?.id) return { ...cached, isPrivate: false, followedByViewer: undefined, postCount: null };
+    if (cached?.id) {
+      return { id: cached.id, username: cached.username || username, isPrivate: false, followedByViewer: undefined, postCount: null };
+    }
 
-    throw errors.find((e) => e.kind === 'rate_limit') || errors.find((e) => e.kind !== 'not_found') ||
+    const errors = [];
+    for (const strategy of [userFromSearch, userFromProfileInfo, userFromProfilePage]) {
+      try {
+        const user = await strategy(username, wanted);
+        if (user?.id) {
+          await rememberUser(user);
+          return user;
+        }
+      } catch (error) {
+        if (!(error instanceof InstagramError) || isFatal(error)) throw error; // incl. "stopped"
+        errors.push(error);
+      }
+    }
+
+    throw errors.find((e) => e.kind === 'rate_limit' || e.kind === 'limited') ||
+      errors.find((e) => e.kind !== 'not_found') ||
       new InstagramError('not_found', `Couldn't find @${username}.`);
   }
 
   // ---- Feeds ---------------------------------------------------------------
 
-  /**
-   * Main profile grid (photos, videos, carousels and reels shared to the grid).
-   * `pace` is awaited between pages, `retry` wraps each request.
-   */
-  async function* userPosts(userId, { pace, retry }) {
+  /** Main profile grid (photos, videos, carousels and reels shared to the grid). */
+  async function* userPosts(userId, { retry }) {
     let maxId = null;
-    for (let page = 0; ; page++) {
-      if (page > 0) await pace();
+    for (;;) {
       const data = await retry(() =>
-        request(`/api/v1/feed/user/${encodeURIComponent(userId)}/`, { params: { count: PAGE_SIZE, max_id: maxId } }),
+        request(`/api/v1/feed/user/${encodeURIComponent(userId)}/`, {
+          params: { count: FEED_PAGE_SIZE, max_id: maxId },
+          what: 'the list of posts',
+        }),
       );
       for (const item of data.items || []) yield item;
       if (!data.more_available || !data.next_max_id || data.next_max_id === maxId) return;
@@ -235,14 +316,14 @@
   }
 
   /** Everything on the profile's Reels tab. */
-  async function* userReels(userId, { pace, retry }) {
+  async function* userReels(userId, { retry }) {
     let maxId = null;
-    for (let page = 0; ; page++) {
-      if (page > 0) await pace();
+    for (;;) {
       const data = await retry(() =>
         request('/api/v1/clips/user/', {
           method: 'POST',
-          form: { target_user_id: userId, page_size: PAGE_SIZE, include_feed_video: 'true', max_id: maxId },
+          form: { target_user_id: userId, page_size: REELS_PAGE_SIZE, include_feed_video: 'true', max_id: maxId },
+          what: 'the Reels tab',
         }),
       );
       for (const entry of data.items || []) if (entry?.media) yield entry.media;
@@ -253,7 +334,7 @@
   }
 
   async function getMedia(shortcode) {
-    const data = await request(`/api/v1/media/${mediaIdFromShortcode(shortcode)}/info/`);
+    const data = await request(`/api/v1/media/${mediaIdFromShortcode(shortcode)}/info/`, { what: 'the post details' });
     const item = data?.items?.[0];
     if (!item) throw new InstagramError('not_found', 'This post is not available.');
     return item;
@@ -325,6 +406,8 @@
   root.ig = {
     InstagramError,
     request,
+    setPacing,
+    looksLoggedIn,
     getUser,
     userPosts,
     userReels,

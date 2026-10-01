@@ -11,7 +11,19 @@
   if (root.saver) return;
 
   const { ig, settings: Settings } = root;
-  const RATE_LIMIT_WAITS_SEC = [60, 120, 240];
+  // How long to wait before each retry, per kind of Instagram problem.
+  // "limited" = Instagram answered with its home page instead of data, which
+  // it does while limiting an account; it clears up after a pause.
+  const RETRY_WAITS_SEC = {
+    network: [5, 15],
+    server: [10, 30],
+    rate_limit: [60, 120, 240],
+    limited: [120, 300, 900],
+  };
+  const WAIT_LABELS = {
+    rate_limit: 'Instagram rate limit, waiting',
+    limited: 'Instagram is limiting your account, waiting',
+  };
   const ONLY_NEW_STOP_AFTER = 12; // this many already-saved posts in a row = caught up
   const RELOADED_MESSAGE = 'The extension was updated or reloaded. Refresh this Instagram tab and try again.';
 
@@ -69,7 +81,7 @@
 
     async countdown(seconds, label) {
       const end = Date.now() + seconds * 1000;
-      const show = () => this.update({ status: `${label} (${Math.max(0, Math.ceil((end - Date.now()) / 1000))}s)` });
+      const show = () => this.update({ status: `${label} (${formatDuration((end - Date.now()) / 1000)})` });
       show();
       const ticker = setInterval(show, 1000); // display only; may tick slower in a background tab
       try {
@@ -130,7 +142,6 @@
 
   // ---- Helpers --------------------------------------------------------------
 
-  const jitter = (ms) => Math.round(ms * (0.7 + Math.random() * 0.6));
   const joinPath = (...parts) => parts.filter(Boolean).join('/');
   const safeSegment = (text) => String(text).replace(/[^A-Za-z0-9._-]/g, '_') || 'unknown';
 
@@ -147,25 +158,62 @@
     return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
   }
 
+  function formatDuration(seconds) {
+    const s = Math.max(0, Math.ceil(seconds));
+    return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+  }
+
   function summarize(stats) {
     return `${stats.uploaded} file(s) saved (${formatBytes(stats.bytes)}), ${stats.skipped} already there, ${stats.failed} failed.`;
   }
 
+  const isLimit = (error) => error?.kind === 'limited' || error?.kind === 'rate_limit';
+
+  /** Final message for a failed job. */
+  function describeError(error) {
+    if (isLimit(error) && error.exhausted) {
+      return `${error.message} It was still limited after waiting, so the job stopped. ` +
+        'Try again in about an hour; files already in Bunny are skipped.';
+    }
+    return error?.message || String(error);
+  }
+
+  // Retries temporary Instagram problems with waits from RETRY_WAITS_SEC.
+  // Each wait is one stoppable timer, so it also works in a background tab.
   async function igRetry(job, fn) {
-    for (let attempt = 0; ; attempt++) {
+    const used = {};
+    for (;;) {
       job.checkStop();
       try {
         return await fn();
       } catch (error) {
-        if (error?.kind === 'network' && attempt < 2) {
-          await job.sleep(5000);
-          continue;
+        const kind = error?.kind;
+        const waits = RETRY_WAITS_SEC[kind];
+        if (!waits) throw error;
+        const attempt = used[kind] || 0;
+        if (attempt >= waits.length) {
+          error.exhausted = true;
+          throw error;
         }
-        if (error?.kind !== 'rate_limit' || attempt >= RATE_LIMIT_WAITS_SEC.length) throw error;
-        const seconds = RATE_LIMIT_WAITS_SEC[attempt];
-        job.log(`Instagram asked us to slow down. Waiting ${seconds}s, then trying again.`, 'warn');
-        await job.countdown(seconds, 'Instagram rate limit, waiting');
+        used[kind] = attempt + 1;
+        const seconds = waits[attempt];
+        job.log(`${error.message} Trying again in ${formatDuration(seconds)}.`, 'warn');
+        if (error.detail) job.log(`Details: ${error.detail}`, 'warn');
+        if (WAIT_LABELS[kind]) await job.countdown(seconds, WAIT_LABELS[kind]);
+        else await job.sleep(seconds * 1000);
       }
+    }
+  }
+
+  // Keeps 1x-2x the configured pause between Instagram requests (6-12 s by
+  // default, like gallery-dl), so a job looks less like a bot.
+  async function withPacing(job, settings, fn) {
+    const baseMs = settings.requestDelaySec * 1000;
+    ig.setPacing({ gapMs: () => Math.round(baseMs * (1 + Math.random())), sleep: (ms) => job.sleep(ms) });
+    try {
+      return await fn();
+    } finally {
+      ig.setPacing(null);
     }
   }
 
@@ -274,8 +322,11 @@
   async function saveProfile(username, options, job) {
     const settings = await loadReadySettings();
     await sendToBackground('ensure-uploader');
+    await withPacing(job, settings, () => runProfile(username, options, job, settings));
+  }
+
+  async function runProfile(username, options, job, settings) {
     const retry = (fn) => igRetry(job, fn);
-    const pace = () => job.sleep(jitter(settings.requestDelaySec * 1000));
 
     job.update({ status: `Looking up @${username}…` });
     const user = await retry(() => ig.getUser(username));
@@ -313,23 +364,39 @@
       }
     };
 
+    // If Instagram keeps limiting the posts list, still try the Reels tab
+    // (a different endpoint) before giving up.
+    let postsProblem = null;
     if (options.posts) {
       const folderFor = (item) => (item.product_type === 'clips' ? (options.reels ? 'reels' : null) : 'posts');
-      await runFeed('Posts', ig.userPosts(user.id, { pace, retry }), folderFor);
+      try {
+        await runFeed('Posts', ig.userPosts(user.id, { retry }), folderFor);
+      } catch (error) {
+        if (!(options.reels && isLimit(error))) throw error;
+        postsProblem = error;
+        job.log(`Posts skipped for now: ${error.message} Moving on to the Reels tab.`, 'warn');
+      }
     }
 
     if (options.reels && job.stats.posts < limit) {
-      if (options.posts) {
-        job.total = limitTotal; // the Reels tab has no known total
-        await pace();
-      }
+      if (options.posts) job.total = limitTotal; // the Reels tab has no known total
       try {
-        await runFeed('Reels', ig.userReels(user.id, { pace, retry }), () => 'reels');
+        await runFeed('Reels', ig.userReels(user.id, { retry }), () => 'reels');
       } catch (error) {
-        const keepGoing = options.posts && error?.kind && !['login', 'checkpoint', 'rate_limit', 'private'].includes(error.kind);
+        const keepGoing = options.posts && !postsProblem && error?.kind &&
+          !['login', 'checkpoint', 'rate_limit', 'limited', 'private'].includes(error.kind);
         if (!keepGoing) throw error;
         job.log(`Couldn't read the Reels tab (${error.message}). Reels shown in the main grid were still saved.`, 'warn');
       }
+    }
+
+    if (postsProblem) {
+      const error = new ig.InstagramError(postsProblem.kind, `Reels are done, but posts were skipped. ${postsProblem.message}`, {
+        status: postsProblem.status,
+        detail: postsProblem.detail,
+      });
+      error.exhausted = true;
+      throw error;
     }
   }
 
@@ -338,18 +405,22 @@
     await sendToBackground('ensure-uploader');
     job.total = 1;
     job.update({ status: 'Reading the post…' });
-    const item = await igRetry(job, () => ig.getMedia(shortcode));
-    const folder = item.product_type === 'clips' ? 'reels' : 'posts';
-    job.update({ status: `Saving ${folder === 'reels' ? 'reel' : 'post'} ${item.code || shortcode}…` });
-    await processPost(job, makeContext(settings), item, folder, item.user?.username);
+    await withPacing(job, settings, async () => {
+      const item = await igRetry(job, () => ig.getMedia(shortcode));
+      const folder = item.product_type === 'clips' ? 'reels' : 'posts';
+      job.update({ status: `Saving ${folder === 'reels' ? 'reel' : 'post'} ${item.code || shortcode}…` });
+      await processPost(job, makeContext(settings), item, folder, item.user?.username);
+    });
   }
 
   root.saver = {
     Job,
     StopError,
+    WAITS: RETRY_WAITS_SEC, // tunable, e.g. by tests
     saveProfile,
     savePost,
     summarize,
+    describeError,
     formatBytes,
     getStatus: () => sendToBackground('get-status'),
     openSettings: () => sendToBackground('open-options'),

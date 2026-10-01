@@ -82,8 +82,9 @@
         text = `Stopped. ${saver.summarize(job.stats)}`;
       } else {
         kind = 'error';
-        text = error.message;
+        text = saver.describeError(error);
         panel.update({ log: { text, level: 'error' } });
+        if (error?.detail) panel.update({ log: { text: `Details: ${error.detail}`, level: 'error' } });
       }
     }
     panel.finishJob(kind, text);

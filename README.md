@@ -51,7 +51,10 @@ Panel options:
 ## Good to know
 
 - **Instagram access.** The extension uses the same internal endpoints as instagram.com, with your logged-in session, so it can only reach content you can already see. Instagram changes these endpoints now and then; if saving breaks, `src/content/instagram-api.js` is the file to update.
-- **Rate limits.** It pauses between Instagram page requests (3 s by default, configurable). If Instagram asks it to slow down, it waits 1, 2, then 4 minutes before giving up. Very large profiles take a while, and heavy use can still get an account temporarily limited.
+- **Instagram's limits.** Instagram temporarily limits accounts that load too much, too fast. When it does, it often sends its home page instead of the requested data.
+  - The extension waits 6–12 s between Instagram requests (the pause is configurable in settings).
+  - If Instagram asks it to slow down, it waits 1, 2, then 4 minutes before giving up. If Instagram sends its home page instead, it waits 2, 5, then 15 minutes.
+  - Very large profiles take a while, and heavy use can still get an account limited for an hour or more. A VPN makes this more likely.
 - **Your password.**
   - It is stored in `chrome.storage.local` on this device only (not synced).
   - Only the extension's hidden uploader page can read it, and it is only ever sent to `*.storage.bunnycdn.com`.
@@ -74,7 +77,11 @@ Panel options:
 | --- | --- |
 | Bunny rejected the request (HTTP 401) | Check the zone name, the storage zone password and the region. |
 | Log in to Instagram in this browser first | Log in on instagram.com, then try again. |
+| … this browser doesn't look logged in to Instagram | Log in at instagram.com in the same Chrome profile the extension is installed in. |
+| Instagram is temporarily limiting your account … | Instagram is pausing your account's access for a while. The extension waits and retries by itself. If it still stops, try again in about an hour, turn off any VPN, and keep the pause in settings at 6 or more. Files already saved are skipped. |
 | Instagram wants you to confirm your account | Complete the check on instagram.com. |
 | … is private and you don't follow them | You can only save what your account can see. |
 | The extension was updated or reloaded … | Refresh the Instagram tab. |
-| Instagram rate limit, waiting (…s) | Normal. It retries automatically. If it gives up, wait about 30 minutes and raise the pause in settings. |
+| Instagram rate limit, waiting (…) | Normal. It retries automatically. If it gives up, wait about 30 minutes and raise the pause in settings. |
+
+Each error in the panel's log is followed by a `Details:` line, for example `GET /api/v1/feed/user/123/ → HTTP 200 after a redirect to /`. Include it when reporting a problem.

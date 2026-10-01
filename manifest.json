@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Instagram to Bunny Storage Saver",
+  "short_name": "IG Bunny Saver",
+  "version": "1.0.0",
+  "description": "Save Instagram photos, videos and reels straight into your Bunny Storage zone.",
+  "minimum_chrome_version": "116",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Save Instagram to Bunny Storage",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "options_ui": {
+    "page": "src/options/options.html",
+    "open_in_tab": true
+  },
+  "permissions": ["storage", "offscreen", "scripting", "notifications"],
+  "host_permissions": [
+    "https://www.instagram.com/*",
+    "https://*.cdninstagram.com/*",
+    "https://*.fbcdn.net/*",
+    "https://*.storage.bunnycdn.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://www.instagram.com/*"],
+      "js": [
+        "src/shared/settings.js",
+        "src/content/instagram-api.js",
+        "src/content/saver.js",
+        "src/content/panel.js",
+        "src/content/main.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

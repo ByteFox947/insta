@@ -1,0 +1,161 @@
+:root {
+  color-scheme: light dark;
+  --accent: #f97316;
+  --accent-dark: #ea580c;
+  --muted: #6b7280;
+  --card: #ffffff;
+  --page: #f4f4f5;
+  --border: #d4d4d8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --muted: #a1a1aa;
+    --card: #1c1c1e;
+    --page: #111113;
+    --border: #3f3f46;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--page);
+  font: 14px/1.5 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+main {
+  max-width: 640px;
+  margin: 32px auto;
+  padding: 0 16px;
+}
+
+.top {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 20px;
+}
+
+h2 {
+  margin: 0 0 12px;
+  font-size: 15px;
+}
+
+.top p {
+  margin: 0;
+  color: var(--muted);
+}
+
+section {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px;
+  margin-bottom: 16px;
+}
+
+label {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 14px;
+  font-weight: 600;
+}
+
+label.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+}
+
+input:not([type='checkbox']),
+select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 400;
+}
+
+select option {
+  background: var(--card);
+}
+
+.hint {
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+}
+
+button {
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+button.primary:hover {
+  background: var(--accent-dark);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+#message.ok {
+  color: #16a34a;
+}
+
+#message.warn {
+  color: #d97706;
+}
+
+#message.error {
+  color: #dc2626;
+}
+
+.help ol {
+  margin: 0 0 10px;
+  padding-left: 20px;
+}
+
+.note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+code {
+  font-size: 12px;
+}
